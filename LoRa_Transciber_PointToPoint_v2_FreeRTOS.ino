@@ -1,6 +1,6 @@
 /*
  * ---------------------------------------------------------------------------
- * ASIGNATURA: SISTEMAS DE SENSORES | MAESTRÍA IOT
+ * 
  * TEMA: FREERTOS DUAL CORE + LORA P2P + CSMA/CA
  * AUTOR: MGTI. Saul Isai Soto Ortiz
  * ---------------------------------------------------------------------------
@@ -282,3 +282,4 @@ void procesar_recepcion(int packetSize) {
     Serial.print(" | RSSI: "); Serial.println(rx_rssi);
   }
 }
+
