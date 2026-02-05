@@ -1,9 +1,15 @@
 /*
  * ---------------------------------------------------------------------------
+ * ASIGNATURA: SISTEMAS DE SENSORES | MAESTRÍA IOT
  * TEMA: FREERTOS DUAL CORE + LORA P2P + CSMA/CA
+ * AUTOR: MGTI. Saul Isai Soto Ortiz
  * ---------------------------------------------------------------------------
- * Core 0: Protocolo LoRa (RX continuo + TX cuando hay cola + Carrier Sense)
- * Core 1: Aplicación (Sensor + Jitter Aleatorio + Pantalla)
+ * * ¿QUÉ VAMOS A APRENDER?
+ * 1. MULTITASKING: Usar los 2 núcleos del ESP32. Un núcleo gestiona la radio (urgente)
+ * y el otro gestiona los sensores y la pantalla (lógica de negocio).
+ * 2. COMUNICACIÓN ENTRE TAREAS: Cómo pasar datos de un núcleo a otro sin que choquen.
+ * 3. SIMULACIÓN DE CAPA DE ENLACE: Implementar CSMA/CA (Evitar colisiones de radio)
+ * y estructura de paquetes similar a lo que hace LoRaWAN internamente.
  */
 
 #include "heltec.h"
@@ -14,135 +20,167 @@
 #define BAND    915E6  
 byte spread_factor = 8; 
 
-// --- Direccionamiento ---
-byte dir_local   = 0xD3; 
-byte dir_destino = 0xC1; 
+// --- Direccionamiento (Capa de Enlace) ---
+// Esto simula la "DevAddr" en LoRaWAN.
+byte dir_local   = 0xC1; 
+byte dir_destino = 0xD3; 
 
 // --- Estructuras de Datos ---
-// Objeto para enviar datos del Core 1 al Core 0
+// ¿Por qué una estructura?
+// Porque en una "Cola" de FreeRTOS es más ordenado enviar un paquete con
+// toda la información junta (el mensaje Y su ID) como si fuera un sobre cerrado.
 struct DatosCola {
   String payload;
   int id_mensaje;
 };
 
-// Variables Compartidas (Protegidas por Mutex) para RX
+// --- Variables Compartidas (Recurso Crítico) ---
+// Estas variables son peligrosas porque DOS núcleos intentan tocarlas al mismo tiempo.
+// Core 0 escribe en ellas cuando recibe radio. Core 1 las lee para mostrarlas en pantalla.
+// REQUIEREN PROTECCIÓN (Mutex).
 String rx_mensaje = "";
 byte   rx_remite = 0;
 int    rx_rssi = 0;
 bool   rx_nuevo_dato = false;
 
-// --- FreeRTOS Handles ---
-TaskHandle_t xHandle_LoRa = NULL;
-TaskHandle_t xHandle_Sensor = NULL;
-SemaphoreHandle_t xMutex_RX;    // Protege lectura/escritura de datos recibidos
-QueueHandle_t xCola_TX;         // Buzón de salida (Sensor -> Radio)
+// --- FreeRTOS Handles (Los "Controladores") ---
+TaskHandle_t xHandle_LoRa = NULL;   // Identificador para controlar al Core 0
+TaskHandle_t xHandle_Sensor = NULL; // Identificador para controlar al Core 1
+
+// SEMÁFORO (MUTEX): Es como la llave del baño. Solo uno puede tenerla.
+// Evita que el Core 1 lea un mensaje a medias mientras el Core 0 lo está escribiendo.
+SemaphoreHandle_t xMutex_RX;    
+
+// COLA (QUEUE): Es como una banda transportadora o buzón.
+// Permite que el Sensor (Core 1) deje datos para enviar y siga trabajando,
+// sin esperar a que la Radio (Core 0) termine de transmitir.
+QueueHandle_t xCola_TX;         
 
 #define LED_PIN 25 
 
 // ==========================================
-// 2. SETUP
+// 2. SETUP (CONFIGURACIÓN DEL SISTEMA)
 // ==========================================
 void setup() {
   Heltec.begin(true /*Display*/, true /*LoRa*/, true /*Serial*/, true /*PABOOST*/, BAND);
   
-  // OLED Init
+  // Inicialización de Pantalla
   Heltec.display->init();
   Heltec.display->flipScreenVertically();
   Heltec.display->setFont(ArialMT_Plain_10);
   Heltec.display->drawString(0, 0, "Iniciando RTOS...");
   Heltec.display->display();
 
-  // LoRa Init
+  // Configuración LoRa
   LoRa.setSpreadingFactor(spread_factor);
-  LoRa.receive(); // Modo escucha inicial
+  LoRa.receive(); // IMPORTANTE: La radio arranca en modo "Escucha"
   
   pinMode(LED_PIN, OUTPUT);
 
-  // --- CREAR OBJETOS DEL SISTEMA OPERATIVO ---
-  xMutex_RX = xSemaphoreCreateMutex();
-  xCola_TX  = xQueueCreate(10, sizeof(DatosCola)); // Cola de 10 mensajes máximo
+  // --- CREACIÓN DE OBJETOS DEL SISTEMA OPERATIVO (OS) ---
+  xMutex_RX = xSemaphoreCreateMutex(); // Creamos la "llave"
+  xCola_TX  = xQueueCreate(10, sizeof(DatosCola)); // Creamos el "buzón" para 10 cartas
 
-  // --- LANZAR TAREAS ---
+  // --- LANZAMIENTO DE TAREAS (MULTIPROCESSING) ---
   
-  // Tarea 1: RADIO LORA (Core 0 - Alta Prioridad)
-  // Se encarga de escuchar SIEMPRE y enviar cuando la cola tenga datos.
+  // Tarea 1: GESTOR DE RADIO (Core 0)
+  // Prioridad 2 (ALTA): La radio es sensible al tiempo, no debe interrumpirse.
   xTaskCreatePinnedToCore(
-    TareaLoRa_Code, "Radio_Task", 4096, NULL, 2, &xHandle_LoRa, 0);
+    TareaLoRa_Code,   // Función a ejecutar
+    "Radio_Task",     // Nombre para depuración
+    4096,             // Memoria asignada (Stack)
+    NULL,             // Parámetros
+    2,                // Prioridad
+    &xHandle_LoRa,    // Handle
+    0);               // ** PINNED TO CORE 0 **
 
-  // Tarea 2: SENSOR Y UI (Core 1 - Prioridad Normal)
-  // Se encarga de la lógica de negocio, tiempos aleatorios y pantalla.
+  // Tarea 2: APLICACIÓN / SENSOR (Core 1)
+  // Prioridad 1 (NORMAL): Si se atrasa unos milisegundos, no pasa nada.
   xTaskCreatePinnedToCore(
-    TareaSensor_Code, "App_Task", 4096, NULL, 1, &xHandle_Sensor, 1);
+    TareaSensor_Code, 
+    "App_Task", 
+    4096, 
+    NULL, 
+    1, 
+    &xHandle_Sensor, 
+    1);               // ** PINNED TO CORE 1 **
     
   Serial.println("--- SISTEMA DUAL CORE INICIADO ---");
-  Serial.println("Comandos: 'P' (Pausar sensor), 'R' (Reanudar sensor)");
+  Serial.println("Core 0: Dedicado a LoRa | Core 1: Dedicado a Sensores");
 }
 
 // ==========================================
-// 3. LOOP (CONTROLADOR)
+// 3. LOOP (CONTROLADOR DE SISTEMA)
 // ==========================================
+// En RTOS, el loop() pierde protagonismo. Aquí lo usamos solo
+// como interfaz de usuario para pausar/reanudar tareas.
 void loop() {
-  // Solo gestiona comandos de usuario
   if (Serial.available()) {
     char c = Serial.read();
+    // Ejemplo de control de tareas en tiempo real
     if (c == 'P' || c == 'p') {
-      Serial.println("CMD: Pausando generación de datos...");
-      vTaskSuspend(xHandle_Sensor); // Pausa Core 1
+      Serial.println("CMD: Pausando tarea del Sensor (Core 1)...");
+      vTaskSuspend(xHandle_Sensor); // Congela la lógica, pero la radio sigue funcionando
     }
     if (c == 'R' || c == 'r') {
-      Serial.println("CMD: Reanudando generación de datos...");
-      vTaskResume(xHandle_Sensor);  // Reanuda Core 1
+      Serial.println("CMD: Reanudando tarea del Sensor...");
+      vTaskResume(xHandle_Sensor);  
     }
   }
-  vTaskDelay(100); // Libera CPU del loop principal
+  vTaskDelay(100); // Delay necesario para no saturar al Watchdog Timer
 }
 
 // ==========================================
-// 4. TAREA CORE 0: PROTOCOLO DE RADIO
+// 4. TAREA CORE 0: PROTOCOLO DE RADIO (DRIVER)
 // ==========================================
+// Esta tarea actúa como un "Servicio de Fondo". Siempre está escuchando.
+// Solo transmite si encuentra algo en la Cola de Salida.
 void TareaLoRa_Code(void * parameter) {
-  DatosCola paqueteSaliente;
+  DatosCola paqueteSaliente; // Variable temporal para sacar datos del buzón
   
-  for(;;) {
+  for(;;) { // Bucle infinito de la tarea
+    
     // -------------------------------------------------
-    // A. GESTIÓN DE RECEPCIÓN (RX)
+    // A. GESTIÓN DE RECEPCIÓN (RX) - "Escuchar siempre"
     // -------------------------------------------------
+    // La radio verifica si llegó algo por el aire.
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
-      procesar_recepcion(packetSize); // Función detallada abajo
+      procesar_recepcion(packetSize); // Desencapsula y valida (ver abajo)
     }
 
     // -------------------------------------------------
-    // B. GESTIÓN DE TRANSMISIÓN (TX)
+    // B. GESTIÓN DE TRANSMISIÓN (TX) - "Enviar si hay pedido"
     // -------------------------------------------------
-    // Revisamos si la otra tarea dejó algo en el buzón.
-    // Usamos wait 0 para no bloquear la recepción.
+    // xQueueReceive verifica el buzón. 
+    // El '0' indica TIEMPO DE ESPERA CERO. Si no hay nada, sigue de largo (No bloquea).
     if (xQueueReceive(xCola_TX, &paqueteSaliente, 0) == pdTRUE) {
       
-      // 1. CARRIER SENSE (CSMA Físico)
-      // Si la radio está ocupada recibiendo o transmitiendo, esperamos.
+      // --- LÓGICA CSMA (Carrier Sense Multiple Access) ---
+      // Antes de hablar, escuchamos. Si el canal está ocupado (RSSI alto), esperamos.
+      // LoRa.beginPacket() devuelve 0 si la radio está ocupada transmitiendo o recibiendo.
       while (LoRa.beginPacket() == 0) { 
-        vTaskDelay(10); // Espera no bloqueante
+        vTaskDelay(10); // Espera pasiva (libera CPU)
       }
       
-      // 2. CONSTRUCCIÓN DEL PAQUETE
+      // --- ENCAPSULAMIENTO TIPO LoRaWAN (Manual) ---
       LoRa.beginPacket();
-      LoRa.write(dir_destino);           // Byte 1: Destino
-      LoRa.write(dir_local);             // Byte 2: Remitente
-      LoRa.write((byte)paqueteSaliente.id_mensaje); // Byte 3: ID
-      LoRa.write((byte)paqueteSaliente.payload.length()); // Byte 4: Len
-      LoRa.print(paqueteSaliente.payload); // Payload
+      LoRa.write(dir_destino);           // Header: ¿A quién?
+      LoRa.write(dir_local);             // Header: ¿De quién?
+      LoRa.write((byte)paqueteSaliente.id_mensaje); // Header: ID (Frame Counter)
+      LoRa.write((byte)paqueteSaliente.payload.length()); // Header: Largo Payload
+      LoRa.print(paqueteSaliente.payload); // Payload: Datos del sensor
       LoRa.endPacket();
       
-      // 3. VUELTA A ESCUCHA
+      // Inmediatamente volvemos a escuchar (Receive Window)
       LoRa.receive(); 
       
-      // Feedback visual TX
+      // Feedback visual hardware
       digitalWrite(LED_PIN, HIGH); vTaskDelay(100); digitalWrite(LED_PIN, LOW);
-      Serial.print("[Core 0] TX ID:"); Serial.println(paqueteSaliente.id_mensaje);
+      Serial.print("[Core 0] TX Enviado ID:"); Serial.println(paqueteSaliente.id_mensaje);
     }
 
-    // Pequeño delay para evitar Watchdog Trigger si no hay actividad
+    // Pequeño descanso para evitar que el Watchdog crea que la tarea se colgó
     vTaskDelay(10 / portTICK_PERIOD_MS); 
   }
 }
@@ -150,56 +188,61 @@ void TareaLoRa_Code(void * parameter) {
 // ==========================================
 // 5. TAREA CORE 1: APLICACIÓN (SENSOR + UI)
 // ==========================================
+// Esta tarea simula el comportamiento "inteligente" del dispositivo.
+// Lee sensores, decide cuándo enviar y actualiza la interfaz.
 void TareaSensor_Code(void * parameter) {
   String estadoSensor = "ON";
   int contador_global = 0;
-  DatosCola datosParaEnviar;
+  DatosCola datosParaEnviar; // Estructura para llenar y meter al buzón
 
   for(;;) {
-    // 1. LECTURA SENSOR (Simulado)
+    // 1. LECTURA SENSOR (Aquí iría el código DHT11/22 real)
     estadoSensor = (estadoSensor == "ON") ? "OFF" : "ON";
     
-    // 2. ENVIAR A COLA (TX)
+    // 2. PREPARAR PAQUETE PARA EL CORE 0
     datosParaEnviar.payload = estadoSensor;
     datosParaEnviar.id_mensaje = contador_global;
     
-    // Enviamos a la cola para que el Core 0 lo procese
+    // Meter al buzón (xCola_TX). 
+    // portMAX_DELAY significa: "Si el buzón está lleno, espérate aquí hasta que haya espacio".
     xQueueSend(xCola_TX, &datosParaEnviar, portMAX_DELAY);
     contador_global++;
 
     // 3. ACTUALIZAR PANTALLA
-    // Esta sección lee las variables compartidas de RX protegidas por Mutex
     Heltec.display->clear();
-    Heltec.display->drawString(0, 0, "Core 1: TX ID " + String(contador_global));
+    Heltec.display->drawString(0, 0, "Core 1: Generando ID " + String(contador_global));
     
-    // -- SECCIÓN CRÍTICA (Lectura RX) --
+    // --- ZONA CRÍTICA (Lectura de datos compartidos) ---
+    // Pedimos la "llave" (Mutex) para leer los datos que dejó el Core 0.
+    // Esperamos máximo 100 ticks si la llave está ocupada.
     if (xSemaphoreTake(xMutex_RX, (TickType_t)100) == pdTRUE) {
       if (rx_nuevo_dato) {
         Heltec.display->drawString(0, 20, "RX de: 0x" + String(rx_remite, HEX));
         Heltec.display->drawString(0, 30, "Msg: " + rx_mensaje);
-        Heltec.display->drawString(0, 40, "RSSI: " + String(rx_rssi));
+        Heltec.display->drawString(0, 40, "RSSI: " + String(rx_rssi) + " dBm");
       } else {
-        Heltec.display->drawString(0, 20, "Esperando datos...");
+        Heltec.display->drawString(0, 20, "Esperando RX...");
       }
-      xSemaphoreGive(xMutex_RX);
+      xSemaphoreGive(xMutex_RX); // ¡Importante! Devolver la llave.
     }
     Heltec.display->display();
 
-    // 4. CSMA/CA (JITTER ALEATORIO)
-    // Aquí implementamos la lógica de "espera aleatoria" del primer código.
-    // 6000ms base + 0 a 3000ms aleatorios.
+    // 4. CA (COLLISION AVOIDANCE) - JITTER
+    // En lugar de enviar cada 6 segundos exactos (lo que causaría colisiones si
+    // todos los alumnos prenden las placas a la vez), añadimos aleatoriedad.
+    // Esto es fundamental en redes LoRaWAN reales para evitar saturación del Gateway.
     long tiempo_wait = 6000 + random(3000);
     vTaskDelay(tiempo_wait / portTICK_PERIOD_MS);
   }
 }
 
 // ==========================================
-// 6. LÓGICA DE RECEPCIÓN DETALLADA (HELPER)
+// 6. LÓGICA DE RECEPCIÓN (HELPER)
 // ==========================================
 void procesar_recepcion(int packetSize) {
   if (packetSize == 0) return;
 
-  // Variables temporales locales (no compartidas aún)
+  // Variables locales (buffer temporal)
   String paq_rcb = "";
   byte   d_envio = LoRa.read();
   byte   d_remite = LoRa.read();
@@ -211,33 +254,31 @@ void procesar_recepcion(int packetSize) {
     paq_rcb += (char)LoRa.read();
   }
 
-  // --- FILTROS DE INTEGRIDAD ---
+  // --- VALIDACIÓN TIPO "LINK LAYER" ---
   
-  // 1. Checksum de longitud
+  // 1. Integridad: ¿Coincide el largo real con el declarado?
   if (paq_rcb.length() != len_msg) {
-    Serial.println("[RX Error] Longitud corrupta");
+    Serial.println("[RX Error] Paquete corrupto (Longitud incorrecta)");
     return; 
   }
 
-  // 2. Filtro de Dirección
+  // 2. Direccionamiento: ¿Es para mí?
   if (d_envio != dir_local && d_envio != 0xFF) {
-    Serial.println("[RX Ignorado] No es para mi");
+    Serial.println("[RX Ignorado] Paquete para otro nodo");
     return;
   }
 
-  // --- GUARDADO SEGURO (MUTEX) ---
-  // Si pasa los filtros, actualizamos las variables globales para la pantalla
+  // --- ZONA CRÍTICA (Escritura) ---
+  // Pedimos la llave para actualizar las variables globales.
   if (xSemaphoreTake(xMutex_RX, (TickType_t)10) == pdTRUE) {
     rx_mensaje = paq_rcb;
     rx_remite  = d_remite;
     rx_rssi    = LoRa.packetRssi();
     rx_nuevo_dato = true;
-    xSemaphoreGive(xMutex_RX); // Liberar llave
+    xSemaphoreGive(xMutex_RX); // Devolver llave
     
-    // Feedback visual RX
-    digitalWrite(LED_PIN, HIGH); vTaskDelay(50); digitalWrite(LED_PIN, LOW);
-    Serial.print("[Core 0] RX de 0x"); Serial.print(d_remite, HEX);
-    Serial.print(": "); Serial.println(paq_rcb);
+    // Log para depuración
+    Serial.print("[Core 0] RX Válido de 0x"); Serial.print(d_remite, HEX);
+    Serial.print(" | RSSI: "); Serial.println(rx_rssi);
   }
 }
-
