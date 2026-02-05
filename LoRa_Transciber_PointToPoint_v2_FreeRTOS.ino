@@ -1,6 +1,5 @@
 /*
  * ---------------------------------------------------------------------------
- * ASIGNATURA: SISTEMAS DE SENSORES | MAESTRÍA IOT
  * TEMA: FREERTOS DUAL CORE + LORA P2P + CSMA/CA
  * ---------------------------------------------------------------------------
  * Core 0: Protocolo LoRa (RX continuo + TX cuando hay cola + Carrier Sense)
@@ -241,3 +240,4 @@ void procesar_recepcion(int packetSize) {
     Serial.print(": "); Serial.println(paq_rcb);
   }
 }
+
