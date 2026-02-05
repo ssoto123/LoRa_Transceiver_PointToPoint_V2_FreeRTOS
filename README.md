@@ -116,6 +116,5 @@ El sistema permite pausar la generación de datos desde el puerto serie, demostr
 ## 👤 Créditos
 
 **Autor:** MGTI. Saúl Isaí Soto Ortiz  
-**Asignatura:** Sistemas de Sensores - Maestría en Internet de las Cosas
 
 > *Este material educativo demuestra cómo elevar un prototipo de Arduino a una arquitectura de firmware profesional utilizando Sistemas Operativos de Tiempo Real.*
