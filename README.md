@@ -35,7 +35,7 @@ Como tenemos dos "cerebros" trabajando en paralelo, necesitamos formas seguras d
 2.  **🔑 El Semáforo (Mutex) - `xMutex_RX`**:
     * Funciona como una **Llave única**.
     * Protege las variables donde se guardan los mensajes recibidos (`rx_mensaje`).
-    * Evita el error de **Condición de Carrera**: Impide que el Core 1 lea un mensaje incompleto mientras el Core 0 lo está escribiendo.
+    * Evita el error de **Condición de Carrera**: Impide que el Core 0 lea un mensaje incompleto mientras el Core 1 lo está escribiendo.
 
 ---
 
