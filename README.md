@@ -60,7 +60,8 @@ Para establecer comunicación, configura los IDs en el encabezado del código:
 ```cpp
 // Nodo A
 byte dir_local   = 0xC1; 
-byte dir_destino = 0xD3; 
+byte dir_destino = 0xD3;
+```
 
 // Nodo B
 byte dir_local   = 0xD3; 
