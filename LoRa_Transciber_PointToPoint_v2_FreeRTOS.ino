@@ -239,47 +239,89 @@ void TareaSensor_Code(void * parameter) {
 // ==========================================
 // 6. LÓGICA DE RECEPCIÓN (HELPER)
 // ==========================================
+/*
+ * PROPÓSITO:
+ * Esta función actúa como el "Portero" del sistema. 
+ * Recibe una trama cruda de bytes, la "desempaqueta", verifica que sea válida 
+ * y la pasa de forma segura al área de memoria compartida.
+ */
 void procesar_recepcion(int packetSize) {
+  // Si el paquete está vacío, no perdemos tiempo.
   if (packetSize == 0) return;
 
-  // Variables locales (buffer temporal)
+  // -----------------------------------------------------------
+  // FASE 1: DESERIALIZACIÓN (ABRIR EL SOBRE)
+  // -----------------------------------------------------------
+  // Los datos llegan en fila india (Stream). Debemos leerlos EN EL MISMO ORDEN
+  // en que fueron empaquetados por el emisor.
+  // Estructura esperada: [DESTINO] [REMITENTE] [ID] [LARGO] [PAYLOAD...]
+
   String paq_rcb = "";
-  byte   d_envio = LoRa.read();
-  byte   d_remite = LoRa.read();
-  byte   id_msg = LoRa.read();
-  byte   len_msg = LoRa.read();
-
-  // Leer Payload
-  while (LoRa.available()) {
-    paq_rcb += (char)LoRa.read();
-  }
-
-  // --- VALIDACIÓN TIPO "LINK LAYER" ---
   
-  // 1. Integridad: ¿Coincide el largo real con el declarado?
-  if (paq_rcb.length() != len_msg) {
-    Serial.println("[RX Error] Paquete corrupto (Longitud incorrecta)");
-    return; 
+  // Leemos los 4 bytes del encabezado (Header)
+  byte d_envio  = LoRa.read(); // Byte 1: Dirección Destino (¿Para quién es?) Ej: 0xC1
+  byte d_remite = LoRa.read(); // Byte 2: Dirección Remitente (¿Quién lo mandó?) Ej: 0xD3
+  byte id_msg   = LoRa.read(); // Byte 3: ID del mensaje (Para control de duplicados)
+  byte len_msg  = LoRa.read(); // Byte 4: Longitud declarada del mensaje. Ej: 4 bytes ("HOLA")
+
+  // -----------------------------------------------------------
+  // FASE 2: RECONSTRUCCIÓN DEL PAYLOAD (LEER LA CARTA)
+  // -----------------------------------------------------------
+  // Todo lo que queda en el buffer después del encabezado es el mensaje real.
+  while (LoRa.available()) {
+    paq_rcb += (char)LoRa.read(); // Concatenamos carácter por carácter: "H"+"O"+"L"+"A"
   }
 
-  // 2. Direccionamiento: ¿Es para mí?
+  // -----------------------------------------------------------
+  // FASE 3: CAPA DE ENLACE (VALIDACIONES DE SEGURIDAD)
+  // -----------------------------------------------------------
+  
+  // A. VALIDACIÓN DE INTEGRIDAD (Checksum Simple)
+  // Comparamos la longitud que "decía" el encabezado (len_msg) contra lo que realmente llegó.
+  // Ejemplo de Fallo: El encabezado dice 4 bytes, pero por ruido solo llegaron "HO" (2 bytes).
+  if (paq_rcb.length() != len_msg) {
+    Serial.println("[RX Error] Paquete corrupto (Longitud incompleta o ruido)");
+    return; // Descartamos el paquete inmediatamente.
+  }
+
+  // B. FILTRADO DE DIRECCIONES (Address Filtering)
+  // Verificamos si el mensaje es para nosotros (Unicast) o para todos (Broadcast).
+  // dir_local: Mi dirección (Ej. 0xC1).
+  // 0xFF: Dirección universal de Broadcast.
   if (d_envio != dir_local && d_envio != 0xFF) {
-    Serial.println("[RX Ignorado] Paquete para otro nodo");
+    // Si d_envio es 0xB5 (otro equipo), lo ignoramos silenciosamente.
+    Serial.println("[RX Ignorado] El paquete no es para este nodo");
     return;
   }
 
-  // --- ZONA CRÍTICA (Escritura) ---
-  // Pedimos la llave para actualizar las variables globales.
+  // -----------------------------------------------------------
+  // FASE 4: ZONA CRÍTICA (MUTEX / SEMÁFORO)
+  // -----------------------------------------------------------
+  /* * PROBLEMA: El Core 1 (Pantalla) puede intentar leer 'rx_mensaje' justo en el milisegundo
+   * en que el Core 0 (Radio) lo está escribiendo. Esto causaría datos basura en pantalla.
+   * * SOLUCIÓN: Usamos un Mutex (Mutual Exclusion). Es como la "Llave del Baño".
+   * Solo quien tiene la llave puede entrar a modificar/leer las variables globales.
+   */
+
+  // xSemaphoreTake: Intentamos tomar la llave. Esperamos máximo 10 ticks si está ocupada.
   if (xSemaphoreTake(xMutex_RX, (TickType_t)10) == pdTRUE) {
-    rx_mensaje = paq_rcb;
-    rx_remite  = d_remite;
-    rx_rssi    = LoRa.packetRssi();
-    rx_nuevo_dato = true;
-    xSemaphoreGive(xMutex_RX); // Devolver llave
     
-    // Log para depuración
+    // --- INICIO DE ZONA SEGURA ---
+    // Aquí adentro NADIE más puede tocar estas variables.
+    
+    rx_mensaje = paq_rcb;          // Guardamos el mensaje validado "HOLA"
+    rx_remite  = d_remite;         // Guardamos quién lo envió (0xD3)
+    rx_rssi    = LoRa.packetRssi();// Guardamos la potencia de señal actual (Ej: -85dBm)
+    rx_nuevo_dato = true;          // Levantamos la bandera para avisar al Core 1
+    
+    // --- FIN DE ZONA SEGURA ---
+    
+    xSemaphoreGive(xMutex_RX); // ¡MUY IMPORTANTE! Devolver la llave para que el Core 1 pueda usarla.
+    
+    // Feedback de depuración
     Serial.print("[Core 0] RX Válido de 0x"); Serial.print(d_remite, HEX);
     Serial.print(" | RSSI: "); Serial.println(rx_rssi);
+  } else {
+    Serial.println("[Error OS] No se pudo obtener el Mutex (Sistema ocupado)");
   }
 }
-
